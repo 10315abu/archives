@@ -1,0 +1,93 @@
+import "server-only";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { cookies } from "next/headers";
+
+export type Role = "editor" | "reader";
+
+const COOKIE_NAME = "abshley_access";
+const SESSION_SECONDS = 60 * 60 * 8;
+
+function sessionSecret() {
+  const value = process.env.SESSION_SECRET;
+  if (!value) throw new Error("SESSION_SECRET is not configured.");
+  return value;
+}
+
+function safeEqual(a: string, b: string) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function signature(payload: string) {
+  return createHmac("sha256", sessionSecret()).update(payload).digest("hex");
+}
+
+export function credentialsMatch(
+  role: Role,
+  username: string,
+  password: string,
+) {
+  if (role === "editor") {
+    const expectedUsername = process.env.EDITOR_USERNAME;
+    const expectedPassword = process.env.EDITOR_PASSWORD;
+
+    return Boolean(
+      expectedUsername &&
+        expectedPassword &&
+        safeEqual(username, expectedUsername) &&
+        safeEqual(password, expectedPassword),
+    );
+  }
+
+  const expectedKey = process.env.READER_KEY;
+  return Boolean(expectedKey && safeEqual(password, expectedKey));
+}
+
+export async function setSession(role: Role) {
+  const expires = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
+  const payload = `${role}.${expires}`;
+  const value = `${payload}.${signature(payload)}`;
+
+  (await cookies()).set(COOKIE_NAME, value, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: SESSION_SECONDS,
+  });
+}
+
+export async function getRole(): Promise<Role | null> {
+  const value = (await cookies()).get(COOKIE_NAME)?.value;
+  if (!value) return null;
+
+  const [role, expires, suppliedSignature, ...extra] = value.split(".");
+  if (
+    extra.length ||
+    (role !== "editor" && role !== "reader") ||
+    !expires ||
+    !suppliedSignature
+  ) {
+    return null;
+  }
+
+  const payload = `${role}.${expires}`;
+
+  try {
+    if (!safeEqual(suppliedSignature, signature(payload))) return null;
+  } catch {
+    return null;
+  }
+
+  const expiryTime = Number(expires);
+  if (!Number.isFinite(expiryTime) || expiryTime < Date.now() / 1000) {
+    return null;
+  }
+
+  return role;
+}
+
+export async function clearSession() {
+  (await cookies()).delete(COOKIE_NAME);
+}
